@@ -25,14 +25,39 @@ torch::Tensor int8_matmul(const torch::Tensor &A,
     return int8_matmul_host(A, B, C, alpha_f);
 }
 
+torch::Tensor int8_matmul_blockwise_scaled(
+    const torch::Tensor &A,
+    const torch::Tensor &B,
+    const torch::Tensor &scale_a,
+    const torch::Tensor &scale_b)
+{
+    torch::checkAllContiguous("int8_matmul_blockwise_scaled", {{A, "A", 0},
+                                                                 {B, "B", 1},
+                                                                 {scale_a, "scale_a", 2},
+                                                                 {scale_b, "scale_b", 3}});
+    torch::checkDeviceType("int8_matmul_blockwise_scaled", {A, B, scale_a, scale_b}, at::DeviceType::CUDA);
+
+    torch::checkAllSameGPU("int8_matmul_blockwise_scaled", {{A, "A", 0},
+                                                             {B, "B", 1},
+                                                             {scale_a, "scale_a", 2},
+                                                             {scale_b, "scale_b", 3}});
+    uint32_t M = A.size(0);
+    uint32_t N = B.size(0);
+    auto C = torch::empty({M, N}, torch::dtype(torch::kBFloat16).device(A.device()));
+
+    return int8_matmul_blockwise_scaled_host(A, B, scale_a, scale_b, C);
+}
+
 //====== pybind ======
 
 TORCH_LIBRARY(gemm_int8_CUDA, m)
 {
     m.def("int8_matmul(Tensor A, Tensor B, float alpha) -> Tensor");
+    m.def("int8_matmul_blockwise_scaled(Tensor A, Tensor B, Tensor scale_a, Tensor scale_b) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(gemm_int8_CUDA, CUDA, m)
 {
     m.impl("int8_matmul", &int8_matmul);
+    m.impl("int8_matmul_blockwise_scaled", &int8_matmul_blockwise_scaled);
 }

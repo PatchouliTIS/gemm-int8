@@ -60,10 +60,15 @@ fi
 echo "Found libtorch at: $LIBTORCH_PATH"
 
 
-build_capability="70;75;80;86;89;90;90a;100;120"
-[[ "${cuda_version}" == 11.7.* ]] && build_capability="70;75;80;86"
-[[ "${cuda_version}" == 12.6.* ]] && build_capability="70;75;80;86;89;90;90a"
-[[ "${cuda_version}" == 12.8.* ]] && build_capability="70;75;80;86;89;90;90a;100;120"
+# Get current GPU compute capability
+gpu_capability=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')
+if [ -z "$gpu_capability" ]; then
+  echo "WARNING: Could not detect GPU compute capability, using default"
+  build_capability="70;75;80;86;89;90;90a;100;120"
+else
+  echo "Detected GPU compute capability: ${gpu_capability:0:1}.${gpu_capability:1}"
+  build_capability="${gpu_capability:0:1}${gpu_capability:1}"
+fi
 
 # Create build directory
 mkdir -p build
