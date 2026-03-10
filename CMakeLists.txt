@@ -121,7 +121,7 @@ message(STATUS "Found PyTorch: ${TORCH_INCLUDE_DIRS}")
 
 # Create source files list
 set(CPP_FILES csrc/kernels/bindings.cpp)
-set(CUDA_FILES csrc/kernels/gemm.cu)
+set(CUDA_FILES csrc/kernels/gemm.cu csrc/kernels/gemm_blockwise_fused.cu)
 
 # Add source files based on backend
 if(BUILD_CUDA)
