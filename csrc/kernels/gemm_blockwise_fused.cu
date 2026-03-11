@@ -29,6 +29,8 @@
 
 #include <cutlass/gemm/threadblock/threadblock_swizzle.h>
 
+#include "custom_mma_multistage.h"
+
 static constexpr int kBlockQuantSize = 128;
 
 // ============================================================
@@ -66,9 +68,19 @@ using DefaultMma = cutlass::gemm::threadblock::DefaultMma<
     false,
     cutlass::gemm::SharedMemoryClearOption::kNone>;
 
-using Mma         = typename DefaultMma::ThreadblockMma;
+using _OrigMma    = typename DefaultMma::ThreadblockMma;
 using IteratorA   = typename DefaultMma::IteratorA;
 using IteratorB   = typename DefaultMma::IteratorB;
+
+// Use custom MMA fork to avoid modifying CUTLASS source
+using Mma = custom_mma::MmaMultistage<
+    typename DefaultMma::MmaCore::Shape,
+    IteratorA, typename DefaultMma::MmaCore::SmemIteratorA,
+    DefaultMma::MmaCore::kCacheOpA,
+    IteratorB, typename DefaultMma::MmaCore::SmemIteratorB,
+    DefaultMma::MmaCore::kCacheOpB,
+    ElementAccum, LayoutOutput,
+    typename DefaultMma::MmaCore::MmaPolicy, kStages>;
 using FragmentC   = typename Mma::FragmentC;
 
 using WarpMmaOperator = typename DefaultMma::MmaCore::MmaPolicy::Operator;
@@ -1270,9 +1282,18 @@ using DefaultMma3 = cutlass::gemm::threadblock::DefaultMma<
     false,
     cutlass::gemm::SharedMemoryClearOption::kNone>;
 
-using Mma3       = typename DefaultMma3::ThreadblockMma;
 using IteratorA3 = typename DefaultMma3::IteratorA;
 using IteratorB3 = typename DefaultMma3::IteratorB;
+
+// Use custom MMA fork to avoid modifying CUTLASS source
+using Mma3 = custom_mma::MmaMultistage<
+    typename DefaultMma3::MmaCore::Shape,
+    IteratorA3, typename DefaultMma3::MmaCore::SmemIteratorA,
+    DefaultMma3::MmaCore::kCacheOpA,
+    IteratorB3, typename DefaultMma3::MmaCore::SmemIteratorB,
+    DefaultMma3::MmaCore::kCacheOpB,
+    ElementAccum, LayoutOutput,
+    typename DefaultMma3::MmaCore::MmaPolicy, kStages3>;
 using FragmentC3 = typename Mma3::FragmentC;
 
 using WarpMmaOp3    = typename DefaultMma3::MmaCore::MmaPolicy::Operator;
@@ -1522,9 +1543,18 @@ using DefaultMmaS = cutlass::gemm::threadblock::DefaultMma<
     false,
     cutlass::gemm::SharedMemoryClearOption::kNone>;
 
-using MmaS       = typename DefaultMmaS::ThreadblockMma;
 using IteratorAS  = typename DefaultMmaS::IteratorA;
 using IteratorBS  = typename DefaultMmaS::IteratorB;
+
+// Use custom MMA fork to avoid modifying CUTLASS source
+using MmaS = custom_mma::MmaMultistage<
+    typename DefaultMmaS::MmaCore::Shape,
+    IteratorAS, typename DefaultMmaS::MmaCore::SmemIteratorA,
+    DefaultMmaS::MmaCore::kCacheOpA,
+    IteratorBS, typename DefaultMmaS::MmaCore::SmemIteratorB,
+    DefaultMmaS::MmaCore::kCacheOpB,
+    ElementAccum, LayoutOutput,
+    typename DefaultMmaS::MmaCore::MmaPolicy, kStagesS>;
 using FragmentCS  = typename MmaS::FragmentC;
 
 using WarpMmaOpS    = typename DefaultMmaS::MmaCore::MmaPolicy::Operator;
@@ -1799,9 +1829,18 @@ using DefaultMmaL = cutlass::gemm::threadblock::DefaultMma<
     false,
     cutlass::gemm::SharedMemoryClearOption::kNone>;
 
-using MmaL       = typename DefaultMmaL::ThreadblockMma;
 using IteratorAL = typename DefaultMmaL::IteratorA;
 using IteratorBL = typename DefaultMmaL::IteratorB;
+
+// Use custom MMA fork to avoid modifying CUTLASS source
+using MmaL = custom_mma::MmaMultistage<
+    typename DefaultMmaL::MmaCore::Shape,
+    IteratorAL, typename DefaultMmaL::MmaCore::SmemIteratorA,
+    DefaultMmaL::MmaCore::kCacheOpA,
+    IteratorBL, typename DefaultMmaL::MmaCore::SmemIteratorB,
+    DefaultMmaL::MmaCore::kCacheOpB,
+    ElementAccum, LayoutOutput,
+    typename DefaultMmaL::MmaCore::MmaPolicy, kStagesL>;
 using FragmentCL = typename MmaL::FragmentC;
 
 using WarpMmaOpL    = typename DefaultMmaL::MmaCore::MmaPolicy::Operator;
