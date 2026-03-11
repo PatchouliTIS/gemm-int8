@@ -100,6 +100,30 @@ def _(x: torch.Tensor, y: torch.Tensor, Q_A: torch.Tensor, Q_B: torch.Tensor,
     return torch.empty(x.shape[0], y.shape[0], device=x.device, dtype=torch.bfloat16)
 
 
+@torch.library.register_fake("gemm_int8_CUDA::int8_blockwise_fused_matmul_hybrid_bias")
+def _(x: torch.Tensor, y: torch.Tensor, Q_A: torch.Tensor, Q_B: torch.Tensor,
+      F_A: torch.Tensor, F_B: torch.Tensor, bias: torch.Tensor,
+      quant_block_size: int, super_group_size: int):
+    torch._check(x.device.type == "cuda", "x must be a CUDA tensor")
+    return torch.empty(x.shape[0], y.shape[0], device=x.device, dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("gemm_int8_CUDA::int8_blockwise_fused_matmul_hybrid_large_bias")
+def _(x: torch.Tensor, y: torch.Tensor, Q_A: torch.Tensor, Q_B: torch.Tensor,
+      F_A: torch.Tensor, F_B: torch.Tensor, bias: torch.Tensor,
+      quant_block_size: int, super_group_size: int):
+    torch._check(x.device.type == "cuda", "x must be a CUDA tensor")
+    return torch.empty(x.shape[0], y.shape[0], device=x.device, dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("gemm_int8_CUDA::int8_blockwise_fused_matmul_hybrid_small_bias")
+def _(x: torch.Tensor, y: torch.Tensor, Q_A: torch.Tensor, Q_B: torch.Tensor,
+      F_A: torch.Tensor, F_B: torch.Tensor, bias: torch.Tensor,
+      quant_block_size: int, super_group_size: int):
+    torch._check(x.device.type == "cuda", "x must be a CUDA tensor")
+    return torch.empty(x.shape[0], y.shape[0], device=x.device, dtype=torch.bfloat16)
+
+
 @torch.library.register_fake("gemm_int8_CUDA::int8_blockwise_fused_matmul_bq512")
 def _(x: torch.Tensor, y: torch.Tensor, Q_A: torch.Tensor, Q_B: torch.Tensor,
       F_A: torch.Tensor, F_B: torch.Tensor,
@@ -297,6 +321,42 @@ def blockwise_fused_matmul_hybrid_small(x: torch.Tensor, y: torch.Tensor,
         x, y, Q_A, Q_B, F_A, F_B, quant_block_size, super_group_size)
 
 
+def blockwise_fused_matmul_hybrid_bias(x: torch.Tensor, y: torch.Tensor,
+                                       Q_A: torch.Tensor, Q_B: torch.Tensor,
+                                       F_A: torch.Tensor, F_B: torch.Tensor,
+                                       bias: torch.Tensor,
+                                       quant_block_size: int = 256,
+                                       super_group_size: int = 4):
+    x, y, Q_A, Q_B, F_A, F_B = _pad_hybrid_k(
+        x, y, Q_A, Q_B, F_A, F_B, quant_block_size, super_group_size)
+    return torch.ops.gemm_int8_CUDA.int8_blockwise_fused_matmul_hybrid_bias(
+        x, y, Q_A, Q_B, F_A, F_B, bias, quant_block_size, super_group_size)
+
+
+def blockwise_fused_matmul_hybrid_large_bias(x: torch.Tensor, y: torch.Tensor,
+                                             Q_A: torch.Tensor, Q_B: torch.Tensor,
+                                             F_A: torch.Tensor, F_B: torch.Tensor,
+                                             bias: torch.Tensor,
+                                             quant_block_size: int = 256,
+                                             super_group_size: int = 4):
+    x, y, Q_A, Q_B, F_A, F_B = _pad_hybrid_k(
+        x, y, Q_A, Q_B, F_A, F_B, quant_block_size, super_group_size)
+    return torch.ops.gemm_int8_CUDA.int8_blockwise_fused_matmul_hybrid_large_bias(
+        x, y, Q_A, Q_B, F_A, F_B, bias, quant_block_size, super_group_size)
+
+
+def blockwise_fused_matmul_hybrid_small_bias(x: torch.Tensor, y: torch.Tensor,
+                                             Q_A: torch.Tensor, Q_B: torch.Tensor,
+                                             F_A: torch.Tensor, F_B: torch.Tensor,
+                                             bias: torch.Tensor,
+                                             quant_block_size: int = 256,
+                                             super_group_size: int = 4):
+    x, y, Q_A, Q_B, F_A, F_B = _pad_hybrid_k(
+        x, y, Q_A, Q_B, F_A, F_B, quant_block_size, super_group_size)
+    return torch.ops.gemm_int8_CUDA.int8_blockwise_fused_matmul_hybrid_small_bias(
+        x, y, Q_A, Q_B, F_A, F_B, bias, quant_block_size, super_group_size)
+
+
 def blockwise_fused_matmul_bq512(x: torch.Tensor, y: torch.Tensor,
                                  Q_A: torch.Tensor, Q_B: torch.Tensor,
                                  F_A: torch.Tensor, F_B: torch.Tensor,
@@ -324,5 +384,8 @@ __all__ = ["matmul", "blockwise_fused_matmul",
            "blockwise_fused_matmul_128x128", "blockwise_fused_matmul_hybrid",
            "blockwise_fused_matmul_hybrid_large",
            "blockwise_fused_matmul_hybrid_small",
+           "blockwise_fused_matmul_hybrid_bias",
+           "blockwise_fused_matmul_hybrid_large_bias",
+           "blockwise_fused_matmul_hybrid_small_bias",
            "blockwise_fused_matmul_bq512", "blockwise_fused_matmul_bq512_fast_dequant",
            "quantize_scales_for_hybrid", "BLOCK_QUANT_SIZE"]

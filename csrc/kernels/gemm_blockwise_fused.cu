@@ -33,6 +33,43 @@
 
 static constexpr int kBlockQuantSize = 128;
 
+// Device helper: add row-broadcast bias to fp32 accumulator before epilogue.
+// bias is [N] vector; each accumulator element gets bias[global_col].
+// Template params encode the MMA fragment -> matrix column mapping for SM80 m16n8k32.
+template <bool kHasBias, typename TileShape_, typename WarpShape_, typename FP32Accum_>
+__device__ __forceinline__
+void apply_bias_to_accum(
+    FP32Accum_& fp32_accum,
+    const float* __restrict__ ptr_bias,
+    int cta_n,
+    int warp_idx,
+    int lane_idx,
+    int N
+) {
+    if constexpr (!kHasBias) return;
+
+    static constexpr int kInstN = 8;
+    static constexpr int kWarpCountM = TileShape_::kM / WarpShape_::kM;
+    static constexpr int kMmaOpsM = WarpShape_::kM / 16;
+
+    int warp_mn = warp_idx % (kWarpCountM * (TileShape_::kN / WarpShape_::kN));
+    int warp_n = warp_mn / kWarpCountM;
+    int lane_col_base = (lane_idx % 4) * 2;
+
+    int col_warp_base = cta_n * TileShape_::kN + warp_n * WarpShape_::kN;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < FP32Accum_::kElements; ++i) {
+        int elem_in_mma = i % 4;
+        int mma_idx = i / 4;
+        int n_op = mma_idx / kMmaOpsM;
+        int col = col_warp_base + n_op * kInstN + lane_col_base + (elem_in_mma % 2);
+        if (col < N) {
+            fp32_accum[i] += ptr_bias[col];
+        }
+    }
+}
+
 // ============================================================
 // Config 1: kK=128, stg=3 (current best)
 // ============================================================
@@ -54,7 +91,6 @@ static constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
 static_assert(TileShape::kK == kBlockQuantSize,
     "kK must equal kBlockQuantSize for direct alignment");
-static constexpr int kTilesPerQuantBlock = 1;
 
 using DefaultMma = cutlass::gemm::threadblock::DefaultMma<
     ElementA, LayoutA, kAlignmentA,
@@ -68,7 +104,6 @@ using DefaultMma = cutlass::gemm::threadblock::DefaultMma<
     false,
     cutlass::gemm::SharedMemoryClearOption::kNone>;
 
-using _OrigMma    = typename DefaultMma::ThreadblockMma;
 using IteratorA   = typename DefaultMma::IteratorA;
 using IteratorB   = typename DefaultMma::IteratorB;
 
@@ -165,7 +200,6 @@ struct KernelParams {
     const float* ptr_scale_B;
     int scale_stride_A;
     int scale_stride_B;
-    int K_blocks;
 };
 
 __global__ void __launch_bounds__(Mma::WarpCount::kCount * 32, 1)
@@ -333,8 +367,6 @@ blockwise_fused_gemm_kernel(KernelParams params) {
 
 // ============================================================
 // Config 2: kK=128, stg=3, dequant every 2 k_tiles (block_size=256)
-// Reuses the same tile config as Config 1. Only dequant frequency changes.
-// This tests the effect of halving the FP32/IMMA ratio (from 1:2 to ~1:1).
 // ============================================================
 
 static constexpr int kBlockQuantSize256 = 256;
@@ -500,16 +532,13 @@ blockwise_fused_gemm_kernel_bq256(KernelParams params) {
 
 
 // ============================================================
-// Config 2b: kK=128, stg=3, dequant every 2 k_tiles (block_size=256)
-// Fast dequant variant: bias-offset method (3 instr/element, 0 XU)
+// Config 2b: kK=128, stg=3, dequant every 2 k_tiles (block_size=256), fast dequant
 // ============================================================
 
 namespace fast_dequant {
 
-// Bias-offset INT32→FP32: adds a constant bias to shift signed values into
-// the non-negative range [0, 2^23), then uses the IEEE754 magic-number trick.
-// SASS: IADD3 + LOP3 + FFMA = 3 instructions/element (2 ALU + 1 FMA, 0 XU).
-// The accumulated bias error is corrected once before epilogue.
+// Bias-offset INT32→FP32: shifts val into [0, 2^23) via IADD3+LOP3, then FFMA corrects bias.
+// Deferred bias correction applied once before epilogue.
 static constexpr uint32_t kMagic = 0x4B000000u;   // FP32 bit pattern of 2^23
 static constexpr int32_t  kBias  = (1 << 22);      // 4194304, shifts range to [0, ~6.3M]
 static constexpr float    kBiasFloat = 8388608.0f + static_cast<float>(kBias);  // 2^23 + bias
@@ -698,8 +727,6 @@ blockwise_fused_gemm_kernel_fast_dequant(KernelParams params) {
 // Dequant frequency: K/512 times (half of bq256).
 // ============================================================
 
-static constexpr int kBlockQuantSize512 = 512;
-
 struct Bq512KernelParams {
     cutlass::gemm::GemmCoord problem_size;
     typename IteratorA::Params params_A;
@@ -712,10 +739,8 @@ struct Bq512KernelParams {
     const int32_t* ptr_Q_B;    // [N_blocks, num_quant_blocks] INT32
     const float* ptr_F_A;      // [M_blocks, num_super_groups] FP32
     const float* ptr_F_B;      // [N_blocks, num_super_groups] FP32
-    int k_tiles_per_qb;         // 512/128 = 4
-    int num_quant_blocks;
+    int k_tiles_per_qb;
     int super_group_size;
-    int num_super_groups;
     int q_stride;
     int f_stride;
 };
@@ -752,7 +777,6 @@ blockwise_fused_gemm_kernel_bq512(Bq512KernelParams params) {
     mma.prologue(iterator_A, iterator_B, gemm_k_iterations);
     mma.gmem_wait();
 
-    // Only 2 accumulators — no register spill
     FragmentC int32_accum;
     int32_accum.clear();
 
@@ -845,12 +869,10 @@ blockwise_fused_gemm_kernel_bq512(Bq512KernelParams params) {
             }
         }
 
-        // Dequant every k_tiles_per_qb kTiles (=4 for block_size=512)
         if ((kt + 1) % k_tiles_per_qb == 0 || kt == total_k_tiles - 1) {
             int qb_idx = kt / k_tiles_per_qb;
             int group_idx = qb_idx / params.super_group_size;
 
-            // Scalar scale reconstruction: combined = float(Q_A * Q_B) * (F_A * F_B)
             int q_a = params.ptr_Q_A[m_qb * params.q_stride + qb_idx];
             int q_b = params.ptr_Q_B[n_qb * params.q_stride + qb_idx];
             float f_a = params.ptr_F_A[m_qb * params.f_stride + group_idx];
@@ -1068,27 +1090,25 @@ struct HybridKernelParams {
     const ElementB* ptr_B;
     typename OutputTileIterator::Params params_D;
     ElementOutput* ptr_D;
-    const int32_t* ptr_Q_A;    // [M_blocks, num_quant_blocks] INT32 (host-quantized)
-    const int32_t* ptr_Q_B;    // [N_blocks, num_quant_blocks] INT32 (host-quantized)
-    const float* ptr_F_A;      // [M_blocks, num_super_groups] FP32
-    const float* ptr_F_B;      // [N_blocks, num_super_groups] FP32
-    int num_quant_blocks;
-    int super_group_size;       // L: quant blocks per super-group
-    int num_super_groups;       // G = ceil(num_quant_blocks / L)
-    int k_tiles_per_qb;         // kTiles per quant block
-    int q_stride;               // stride for Q arrays (= num_quant_blocks)
-    int f_stride;               // stride for F arrays (= num_super_groups)
-    int log_swizzle;            // log2 of swizzle tile size (0=disabled)
-    int grid_tiled_n;           // original tiled_n before swizzle remapping
+    const int32_t* ptr_Q_A;
+    const int32_t* ptr_Q_B;
+    const float* ptr_F_A;
+    const float* ptr_F_B;
+    const float* ptr_bias;      // [N] FP32, nullable
+    int super_group_size;
+    int k_tiles_per_qb;
+    int q_stride;
+    int f_stride;
+    int log_swizzle;
+    int grid_tiled_n;
 };
 
 // Kernel: full-INT32 K-loop, zero I2F until epilogue.
-// 2 accumulators only: int32_accum (per-qb IMMA) + int32_weighted (full-K IMUL).
-// At each qb boundary: int32_weighted[i] += Q_combined * int32_accum[i] (pure IMUL).
+// 2 accumulators: int32_accum (per-qb IMMA) + int32_weighted (full-K IMUL).
+// At each qb boundary: int32_weighted[i] += Q_combined * int32_accum[i].
 // Epilogue: fp32 = float(int32_weighted) * (F_A * F_B).
-// F_A/F_B are per-row scalars (single super-group covering entire K).
-// Register cost: 64 + 64 = 128 INT32 regs for accumulators (no FP32 accum in mainloop).
 
+template <bool kHasBias>
 __global__ void __launch_bounds__(Mma::WarpCount::kCount * 32, 1)
 blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
     extern __shared__ char smem_buf[];
@@ -1128,10 +1148,10 @@ blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
     mma.prologue(iterator_A, iterator_B, gemm_k_iterations);
     mma.gmem_wait();
 
-    FragmentC int32_accum;       // per-quant-block IMMA accumulator
+    FragmentC int32_accum;
     int32_accum.clear();
 
-    FragmentC int32_weighted;    // full-K weighted accumulator (pure INT32)
+    FragmentC int32_weighted;
     int32_weighted.clear();
 
     typename Mma::PipeState pipe_state;
@@ -1218,7 +1238,6 @@ blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
             }
         }
 
-        // Quant block boundary: pure IMUL, zero I2F
         if ((kt + 1) % k_tiles_per_qb == 0 || kt == total_k_tiles - 1) {
             int qb_idx = kt / k_tiles_per_qb;
             int q_combined = params.ptr_Q_A[m_qb * params.q_stride + qb_idx]
@@ -1232,7 +1251,7 @@ blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
         }
     }
 
-    // Epilogue: single I2F + FP32 scale at the very end
+    // Single I2F + FP32 scale at epilogue
     float fa = params.ptr_F_A[m_qb * params.f_stride];
     float fb = params.ptr_F_B[n_qb * params.f_stride];
     float F_final = fa * fb;
@@ -1242,6 +1261,9 @@ blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
     for (int i = 0; i < FP32AccumulatorTile::kElements; ++i) {
         fp32_accum[i] = static_cast<float>(int32_weighted[i]) * F_final;
     }
+
+    apply_bias_to_accum<kHasBias, TileShape, WarpShape, FP32AccumulatorTile>(
+        fp32_accum, params.ptr_bias, cta_n, warp_idx, lane_idx, N);
 
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();
@@ -1260,9 +1282,8 @@ blockwise_fused_gemm_kernel_hybrid(HybridKernelParams params) {
 }
 
 // ============================================================
-// Config 3: TileShape 128x128x128, stages=2 (optimized for large-M small-K)
+// Config 3: TileShape 128x128x128, stages=3 (optimized for large-M small-K)
 // Doubles tile_N from 64→128, halving grid_N and B-matrix loads.
-// stages=2 keeps smem at 64KB to allow 2 CTAs/SM.
 // ============================================================
 
 namespace config3 {
@@ -1365,7 +1386,6 @@ struct KernelParams3 {
     const float* ptr_scale_B;
     int scale_stride_A;
     int scale_stride_B;
-    int K_blocks;
 };
 
 __global__ void __launch_bounds__(Mma3::WarpCount::kCount * 32, 2)
@@ -1626,9 +1646,8 @@ struct HybridKernelParamsS {
     const int32_t* ptr_Q_B;
     const float* ptr_F_A;
     const float* ptr_F_B;
-    int num_quant_blocks;
+    const float* ptr_bias;
     int super_group_size;
-    int num_super_groups;
     int k_tiles_per_qb;
     int q_stride;
     int f_stride;
@@ -1636,6 +1655,7 @@ struct HybridKernelParamsS {
     int grid_tiled_n;
 };
 
+template <bool kHasBias>
 __global__ void __launch_bounds__(MmaS::WarpCount::kCount * 32, 2)
 blockwise_fused_gemm_kernel_hybrid_small(HybridKernelParamsS params) {
     extern __shared__ char smem_buf[];
@@ -1787,6 +1807,9 @@ blockwise_fused_gemm_kernel_hybrid_small(HybridKernelParamsS params) {
         fp32_accum[i] = static_cast<float>(int32_weighted[i]) * F_final;
     }
 
+    apply_bias_to_accum<kHasBias, TileShapeS, WarpShapeS, FP32AccumS>(
+        fp32_accum, params.ptr_bias, cta_n, warp_idx, lane_idx, N);
+
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();
     __syncthreads();
@@ -1912,9 +1935,8 @@ struct HybridKernelParamsL {
     const int32_t* ptr_Q_B;
     const float* ptr_F_A;
     const float* ptr_F_B;
-    int num_quant_blocks;
+    const float* ptr_bias;
     int super_group_size;
-    int num_super_groups;
     int k_tiles_per_qb;
     int q_stride;
     int f_stride;
@@ -1922,6 +1944,7 @@ struct HybridKernelParamsL {
     int grid_tiled_n;
 };
 
+template <bool kHasBias>
 __global__ void __launch_bounds__(MmaL::WarpCount::kCount * 32, 1)
 blockwise_fused_gemm_kernel_hybrid_large(HybridKernelParamsL params) {
     extern __shared__ char smem_buf[];
@@ -1931,7 +1954,6 @@ blockwise_fused_gemm_kernel_hybrid_large(HybridKernelParamsL params) {
     int warp_idx   = cutlass::canonical_warp_idx_sync();
     int lane_idx   = threadIdx.x % 32;
 
-    // Threadblock swizzle: remap blockIdx to improve L2 locality
     int log_tile = params.log_swizzle;
     int cta_m = blockIdx.x >> log_tile;
     int cta_n = (blockIdx.y << log_tile) + (blockIdx.x & ((1 << log_tile) - 1));
@@ -2075,6 +2097,9 @@ blockwise_fused_gemm_kernel_hybrid_large(HybridKernelParamsL params) {
         fp32_accum[i] = static_cast<float>(int32_weighted[i]) * F_final;
     }
 
+    apply_bias_to_accum<kHasBias, TileShapeL, WarpShapeL, FP32AccumL>(
+        fp32_accum, params.ptr_bias, cta_n, warp_idx, lane_idx, N);
+
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();
     __syncthreads();
@@ -2117,12 +2142,10 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_large_host(
     int tiled_m = (M + TileShapeL::kM - 1) / TileShapeL::kM;
     int tiled_n = (N + TileShapeL::kN - 1) / TileShapeL::kN;
 
-    // Compute swizzle factor (same logic as GemmIdentityThreadblockSwizzle<1>)
     int log_swizzle = 0;
-    if (tiled_n >= 6) log_swizzle = 3;
-    else if (tiled_n >= 3) log_swizzle = 2;
-    else if (tiled_n >= 2) log_swizzle = 1;
-
+    for (int s = 3; s >= 1; --s) {
+        if (tiled_n >= (1 << s)) { log_swizzle = s; break; }
+    }
     int swizzle_tile = 1 << log_swizzle;
 
     HybridKernelParamsL params;
@@ -2131,9 +2154,8 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_large_host(
     params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
     params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
     params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
-    params.num_quant_blocks = num_quant_blocks;
+    params.ptr_bias          = nullptr;
     params.super_group_size = static_cast<int>(super_group_size);
-    params.num_super_groups = num_super_groups;
     params.k_tiles_per_qb   = k_tiles_per_qb;
     params.q_stride          = num_quant_blocks;
     params.f_stride          = num_super_groups;
@@ -2154,19 +2176,18 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_large_host(
 
     if (smem_size > 48 * 1024) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            blockwise_fused_gemm_kernel_hybrid_large,
+            blockwise_fused_gemm_kernel_hybrid_large<false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
     }
 
-    blockwise_fused_gemm_kernel_hybrid_large<<<grid, block, smem_size, stream>>>(params);
+    blockwise_fused_gemm_kernel_hybrid_large<false><<<grid, block, smem_size, stream>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;
 }
 
-torch::Tensor int8_blockwise_fused_matmul_hybrid_small_host(
-    torch::Tensor input_q,
+torch::Tensor int8_blockwise_fused_matmul_hybrid_small_host(    torch::Tensor input_q,
     torch::Tensor weight_q,
     torch::Tensor Q_A,
     torch::Tensor Q_B,
@@ -2192,9 +2213,8 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_small_host(
     params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
     params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
     params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
-    params.num_quant_blocks = num_quant_blocks;
+    params.ptr_bias          = nullptr;
     params.super_group_size = static_cast<int>(super_group_size);
-    params.num_super_groups = num_super_groups;
     params.k_tiles_per_qb   = k_tiles_per_qb;
     params.q_stride          = num_quant_blocks;
     params.f_stride          = num_super_groups;
@@ -2225,12 +2245,12 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_small_host(
 
     if (smem_size > 48 * 1024) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            blockwise_fused_gemm_kernel_hybrid_small,
+            blockwise_fused_gemm_kernel_hybrid_small<false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
     }
 
-    blockwise_fused_gemm_kernel_hybrid_small<<<grid, block, smem_size, stream>>>(params);
+    blockwise_fused_gemm_kernel_hybrid_small<false><<<grid, block, smem_size, stream>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;
@@ -2262,9 +2282,8 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_host(
     params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
     params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
     params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
-    params.num_quant_blocks = num_quant_blocks;
+    params.ptr_bias          = nullptr;
     params.super_group_size = static_cast<int>(super_group_size);
-    params.num_super_groups = num_super_groups;
     params.k_tiles_per_qb   = k_tiles_per_qb;
     params.q_stride          = num_quant_blocks;
     params.f_stride          = num_super_groups;
@@ -2295,12 +2314,226 @@ torch::Tensor int8_blockwise_fused_matmul_hybrid_host(
 
     if (smem_size > 48 * 1024) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
-            blockwise_fused_gemm_kernel_hybrid,
+            blockwise_fused_gemm_kernel_hybrid<false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size));
     }
 
-    blockwise_fused_gemm_kernel_hybrid<<<grid, block, smem_size, stream>>>(params);
+    blockwise_fused_gemm_kernel_hybrid<false><<<grid, block, smem_size, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+// ============================================================
+// Bias variants: reuse the same kernels with ptr_bias != nullptr
+// ============================================================
+
+torch::Tensor int8_blockwise_fused_matmul_hybrid_bias_host(
+    torch::Tensor input_q,
+    torch::Tensor weight_q,
+    torch::Tensor Q_A,
+    torch::Tensor Q_B,
+    torch::Tensor F_A,
+    torch::Tensor F_B,
+    torch::Tensor bias,
+    int64_t quant_block_size,
+    int64_t super_group_size
+) {
+    int M = input_q.size(0);
+    int K = input_q.size(1);
+    int N = weight_q.size(0);
+    int num_quant_blocks = (K + static_cast<int>(quant_block_size) - 1) / static_cast<int>(quant_block_size);
+    int k_tiles_per_qb = static_cast<int>(quant_block_size) / TileShape::kK;
+    int num_super_groups = (num_quant_blocks + static_cast<int>(super_group_size) - 1) / static_cast<int>(super_group_size);
+
+    auto out = torch::empty({M, N},
+        torch::dtype(torch::kBFloat16).device(input_q.device()));
+
+    HybridKernelParams params;
+    params.problem_size     = {M, N, K};
+    params.ptr_Q_A          = static_cast<const int32_t*>(Q_A.data_ptr());
+    params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
+    params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
+    params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
+    params.ptr_bias          = static_cast<const float*>(bias.data_ptr());
+    params.super_group_size = static_cast<int>(super_group_size);
+    params.k_tiles_per_qb   = k_tiles_per_qb;
+    params.q_stride          = num_quant_blocks;
+    params.f_stride          = num_super_groups;
+    params.ptr_D             = static_cast<ElementOutput*>(out.data_ptr());
+    params.params_A          = typename IteratorA::Params(LayoutA::packed({M, K}));
+    params.ptr_A             = static_cast<const ElementA*>(input_q.data_ptr());
+    params.params_B          = typename IteratorB::Params(LayoutB::packed({K, N}));
+    params.ptr_B             = static_cast<const ElementB*>(weight_q.data_ptr());
+    params.params_D          = typename OutputTileIterator::Params(LayoutOutput::packed({M, N}));
+
+    int tiled_m = (M + TileShape::kM - 1) / TileShape::kM;
+    int tiled_n = (N + TileShape::kN - 1) / TileShape::kN;
+
+    int log_swizzle = 0;
+    for (int s = 3; s >= 1; --s) {
+        if (tiled_n >= (1 << s)) { log_swizzle = s; break; }
+    }
+    int swizzle_tile = 1 << log_swizzle;
+
+    params.log_swizzle  = log_swizzle;
+    params.grid_tiled_n = tiled_n;
+
+    dim3 grid(tiled_m * swizzle_tile, (tiled_n + swizzle_tile - 1) / swizzle_tile, 1);
+    dim3 block(Mma::WarpCount::kCount * 32);
+
+    int smem_size = static_cast<int>(sizeof(SharedStorage));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (smem_size > 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            blockwise_fused_gemm_kernel_hybrid<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+    }
+
+    blockwise_fused_gemm_kernel_hybrid<true><<<grid, block, smem_size, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor int8_blockwise_fused_matmul_hybrid_small_bias_host(    torch::Tensor input_q,
+    torch::Tensor weight_q,
+    torch::Tensor Q_A,
+    torch::Tensor Q_B,
+    torch::Tensor F_A,
+    torch::Tensor F_B,
+    torch::Tensor bias,
+    int64_t quant_block_size,
+    int64_t super_group_size
+) {
+    using namespace config_small;
+    int M = input_q.size(0);
+    int K = input_q.size(1);
+    int N = weight_q.size(0);
+    int num_quant_blocks = (K + static_cast<int>(quant_block_size) - 1) / static_cast<int>(quant_block_size);
+    int k_tiles_per_qb = static_cast<int>(quant_block_size) / TileShapeS::kK;
+    int num_super_groups = (num_quant_blocks + static_cast<int>(super_group_size) - 1) / static_cast<int>(super_group_size);
+
+    auto out = torch::empty({M, N},
+        torch::dtype(torch::kBFloat16).device(input_q.device()));
+
+    HybridKernelParamsS params;
+    params.problem_size     = {M, N, K};
+    params.ptr_Q_A          = static_cast<const int32_t*>(Q_A.data_ptr());
+    params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
+    params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
+    params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
+    params.ptr_bias          = static_cast<const float*>(bias.data_ptr());
+    params.super_group_size = static_cast<int>(super_group_size);
+    params.k_tiles_per_qb   = k_tiles_per_qb;
+    params.q_stride          = num_quant_blocks;
+    params.f_stride          = num_super_groups;
+    params.ptr_D             = static_cast<ElementOutput*>(out.data_ptr());
+    params.params_A          = typename IteratorAS::Params(LayoutA::packed({M, K}));
+    params.ptr_A             = static_cast<const ElementA*>(input_q.data_ptr());
+    params.params_B          = typename IteratorBS::Params(LayoutB::packed({K, N}));
+    params.ptr_B             = static_cast<const ElementB*>(weight_q.data_ptr());
+    params.params_D          = typename OutTileIterS::Params(LayoutOutput::packed({M, N}));
+
+    int tiled_m = (M + TileShapeS::kM - 1) / TileShapeS::kM;
+    int tiled_n = (N + TileShapeS::kN - 1) / TileShapeS::kN;
+
+    int log_swizzle = 0;
+    for (int s = 3; s >= 1; --s) {
+        if (tiled_n >= (1 << s)) { log_swizzle = s; break; }
+    }
+    int swizzle_tile = 1 << log_swizzle;
+
+    params.log_swizzle  = log_swizzle;
+    params.grid_tiled_n = tiled_n;
+
+    dim3 grid(tiled_m * swizzle_tile, (tiled_n + swizzle_tile - 1) / swizzle_tile, 1);
+    dim3 block(MmaS::WarpCount::kCount * 32);
+
+    int smem_size = static_cast<int>(sizeof(SharedStorageS));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (smem_size > 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            blockwise_fused_gemm_kernel_hybrid_small<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+    }
+
+    blockwise_fused_gemm_kernel_hybrid_small<true><<<grid, block, smem_size, stream>>>(params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+torch::Tensor int8_blockwise_fused_matmul_hybrid_large_bias_host(
+    torch::Tensor input_q,
+    torch::Tensor weight_q,
+    torch::Tensor Q_A,
+    torch::Tensor Q_B,
+    torch::Tensor F_A,
+    torch::Tensor F_B,
+    torch::Tensor bias,
+    int64_t quant_block_size,
+    int64_t super_group_size
+) {
+    using namespace config_large;
+    int M = input_q.size(0);
+    int K = input_q.size(1);
+    int N = weight_q.size(0);
+    int num_quant_blocks = (K + static_cast<int>(quant_block_size) - 1) / static_cast<int>(quant_block_size);
+    int k_tiles_per_qb = static_cast<int>(quant_block_size) / TileShapeL::kK;
+    int num_super_groups = (num_quant_blocks + static_cast<int>(super_group_size) - 1) / static_cast<int>(super_group_size);
+
+    auto out = torch::empty({M, N},
+        torch::dtype(torch::kBFloat16).device(input_q.device()));
+
+    int tiled_m = (M + TileShapeL::kM - 1) / TileShapeL::kM;
+    int tiled_n = (N + TileShapeL::kN - 1) / TileShapeL::kN;
+
+    int log_swizzle = 0;
+    for (int s = 3; s >= 1; --s) {
+        if (tiled_n >= (1 << s)) { log_swizzle = s; break; }
+    }
+    int swizzle_tile = 1 << log_swizzle;
+
+    HybridKernelParamsL params;
+    params.problem_size     = {M, N, K};
+    params.ptr_Q_A          = static_cast<const int32_t*>(Q_A.data_ptr());
+    params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
+    params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
+    params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
+    params.ptr_bias          = static_cast<const float*>(bias.data_ptr());
+    params.super_group_size = static_cast<int>(super_group_size);
+    params.k_tiles_per_qb   = k_tiles_per_qb;
+    params.q_stride          = num_quant_blocks;
+    params.f_stride          = num_super_groups;
+    params.log_swizzle       = log_swizzle;
+    params.grid_tiled_n      = tiled_n;
+    params.ptr_D             = static_cast<ElementOutput*>(out.data_ptr());
+    params.params_A          = typename IteratorAL::Params(LayoutA::packed({M, K}));
+    params.ptr_A             = static_cast<const ElementA*>(input_q.data_ptr());
+    params.params_B          = typename IteratorBL::Params(LayoutB::packed({K, N}));
+    params.ptr_B             = static_cast<const ElementB*>(weight_q.data_ptr());
+    params.params_D          = typename OutTileIterL::Params(LayoutOutput::packed({M, N}));
+
+    dim3 grid(tiled_m * swizzle_tile, (tiled_n + swizzle_tile - 1) / swizzle_tile, 1);
+    dim3 block(MmaL::WarpCount::kCount * 32);
+
+    int smem_size = static_cast<int>(sizeof(SharedStorageL));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (smem_size > 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            blockwise_fused_gemm_kernel_hybrid_large<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+    }
+
+    blockwise_fused_gemm_kernel_hybrid_large<true><<<grid, block, smem_size, stream>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return out;
@@ -2332,9 +2565,7 @@ torch::Tensor int8_blockwise_fused_matmul_bq512_host(
     params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
     params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
     params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
-    params.num_quant_blocks = num_quant_blocks;
     params.super_group_size = static_cast<int>(super_group_size);
-    params.num_super_groups = num_super_groups;
     params.k_tiles_per_qb   = k_tiles_per_qb;
     params.q_stride          = num_quant_blocks;
     params.f_stride          = num_super_groups;
@@ -2393,9 +2624,7 @@ torch::Tensor int8_blockwise_fused_matmul_bq512_fast_dequant_host(
     params.ptr_Q_B          = static_cast<const int32_t*>(Q_B.data_ptr());
     params.ptr_F_A          = static_cast<const float*>(F_A.data_ptr());
     params.ptr_F_B          = static_cast<const float*>(F_B.data_ptr());
-    params.num_quant_blocks = num_quant_blocks;
     params.super_group_size = static_cast<int>(super_group_size);
-    params.num_super_groups = num_super_groups;
     params.k_tiles_per_qb   = k_tiles_per_qb;
     params.q_stride          = num_quant_blocks;
     params.f_stride          = num_super_groups;
@@ -2444,7 +2673,6 @@ torch::Tensor int8_blockwise_fused_matmul_fast_dequant_host(
 
     KernelParams params;
     params.problem_size   = {M, N, K};
-    params.K_blocks       = K_blocks;
     params.scale_stride_A = K_blocks;
     params.scale_stride_B = K_blocks;
     params.ptr_scale_A    = static_cast<const float*>(input_scale.data_ptr());
@@ -2495,7 +2723,6 @@ torch::Tensor int8_blockwise_fused_matmul_128x128_host(
 
     KernelParams3 params;
     params.problem_size   = {M, N, K};
-    params.K_blocks       = K_blocks;
     params.scale_stride_A = K_blocks;
     params.scale_stride_B = K_blocks;
     params.ptr_scale_A    = static_cast<const float*>(input_scale.data_ptr());
@@ -2545,7 +2772,6 @@ torch::Tensor int8_blockwise_fused_matmul_kk256_host(
 
     KernelParams params;
     params.problem_size   = {M, N, K};
-    params.K_blocks       = K_blocks;
     params.scale_stride_A = K_blocks;
     params.scale_stride_B = K_blocks;
     params.ptr_scale_A    = static_cast<const float*>(input_scale.data_ptr());
@@ -2595,7 +2821,6 @@ torch::Tensor int8_blockwise_fused_matmul_host(
 
     KernelParams params;
     params.problem_size   = {M, N, K};
-    params.K_blocks       = K_blocks;
     params.scale_stride_A = K_blocks;
     params.scale_stride_B = K_blocks;
     params.ptr_scale_A    = static_cast<const float*>(input_scale.data_ptr());
