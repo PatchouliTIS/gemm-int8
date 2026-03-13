@@ -1,161 +1,287 @@
-# INT8 GEMM with PyTorch Interface
+# Fused Blockwise INT8 GEMM Kernels
 
-<!-- [![PyPI version](https://badge.fury.io/py/gemm-int8.svg)](https://badge.fury.io/py/gemm-int8) -->
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![CUDA 11.8+](https://img.shields.io/badge/CUDA-11.8%2B-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-<!-- [![GitHub stars](https://img.shields.io/github/stars/IST-DASLab/gemm-int8.svg)](https://github.com/IST-DASLab/gemm-int8/stargazers) -->
-<!-- [![GitHub issues](https://img.shields.io/github/issues/IST-DASLab/gemm-int8.svg)](https://github.com/IST-DASLab/gemm-int8/issues) -->
 
-A PyTorch CUDA extension providing high-performance INT8 matrix multiplication operations utilizing CUTLASS iterators. Specifically optimized for modern NVIDIA GPUs including Ada Lovelace and Hopper architectures, this library offers measurable performance improvements over standard BF16 matrix multiplication in deep learning applications. (It was originally used in [HALO: Hadamard-Assisted Low-Precision Optimization and Training method for finetuning LLMs](https://github.com/IST-DASLab/HALO))
+High-performance **fused blockwise-dequantization INT8 GEMM** kernels for W8A8 quantized inference, built on CUTLASS SM80 Tensor Core primitives. All dequantization happens **in-register** inside the mainloop — zero intermediate HBM traffic, zero extra kernel launches.
 
-## Features
+## Key Optimizations
 
-- INT8 matrix multiplication with PyTorch integration, providing up to 4x speedup on RTX 4090 GPUs
-- Compatible with PyTorch's torch.compile (autograd not supported)
-- Optimized CUDA kernels for compute capabilities 89-100 (Ada Lovelace, Hopper)
-- Tuned kernel configurations for common matrix dimensions in transformer models
-- Direct integration with existing PyTorch workflows
+The core innovation lives in [`csrc/kernels/gemm_blockwise_fused.cu`](csrc/kernels/gemm_blockwise_fused.cu). Multiple kernel variants are provided, each targeting a different trade-off between dequantization overhead and quantization granularity:
 
-## Quick Start
+### 1. Fused Mainloop Dequantization (bq128 / bq256)
 
-```bash
-# Install from GitHub releases
-pip install https://github.com/IST-DASLab/gemm-int8/releases/download/latest/gemm_int8-1.0.0-py3-none-manylinux_2_24_x86_64.whl
-```
+- **Tile shape**: `128×64×128` (M×N×K), 3-stage async pipeline
+- CUTLASS `cp.async` multi-stage mainloop drives GMEM→SMEM→RF data flow
+- After each K-tile's IMMA (`m16n8k32`), INT32 partial products are **immediately dequantized** to FP32 using per-block scales:
+  ```
+  fp32_accum[i] += float(int32_accum[i]) * scale_A[m_qb, kt] * scale_B[n_qb, kt]
+  ```
+- INT32 accumulator is cleared per K-tile, preventing overflow at large K
+- bq256 variant accumulates 2 K-tiles before dequant, halving scale loads
 
-```python
-import torch
-import gemm_int8
+### 2. Bias-Offset Fast Dequant (bq256 fast_dequant)
 
-# Create input tensors
-a = torch.randint(-128, 127, (1024, 4096), device='cuda', dtype=torch.int8)
-b = torch.randint(-128, 127, (4096, 4096), device='cuda', dtype=torch.int8)
+- Replaces the standard `I2F` (INT32→FP32 conversion) with a **bias-offset magic number trick**:
+  ```c
+  uint32_t u = (uint32_t)(val + kBias) | 0x4B000000u;  // kBias = 2^22
+  float result = __int_as_float(u);  // == 2^23 + val + bias
+  ```
+- 3 instructions per element (IADD3 + LOP3 + FMUL), **0 XU (conversion unit) usage**
+- Deferred bias correction: `fp32_accum[i] -= kBiasFloat * sum(scales)` applied once before epilogue
 
-# Perform INT8 matrix multiplication (compute a @ b.t())
-result = gemm_int8.matmul(a, b, alpha=1.0)  # Returns bfloat16 tensor of (a @ b.t()) * alpha
-```
+### 3. Hybrid IMUL + Magic Dequant (⭐ Recommended)
 
-Performs matrix multiplication in the form of `(x @ y.t()) * alpha`.
+The **highest-performance** variant. Two-level scale quantization eliminates all FP32 work from the K-loop:
 
-**Parameters:**
-- `x` (torch.Tensor): Input matrix of shape (M, K) with dtype torch.int8
-- `y` (torch.Tensor): Input matrix of shape (N, K) with dtype torch.int8
-- `alpha` (float, optional): Scaling factor applied to the output. Default: 1.0
+- **Host-side**: 2nd-level scale quantization splits each FP32 scale `S_k` into `Q_k` (INT32) × `F_g` (FP32 per super-group)
+- **K-loop (pure INT32)**: `int32_weighted[i] += Q_combined * int32_accum[i]` — only IMAD instructions
+- **Epilogue (single I2F)**: `fp32[i] = float(int32_weighted[i]) * (F_A * F_B)`
+- Supports optional **fused bias addition** in the epilogue (row-broadcast, zero-overhead)
+- **Threadblock swizzle** for L2 cache locality
 
-**Returns:**
-- torch.Tensor: Result matrix of shape (M, N) with dtype torch.bfloat16
+Three CTA tile configurations:
+
+| Config | Tile (M×N×K) | Warp Shape | Best For |
+|--------|-------------|------------|----------|
+| `hybrid` (default) | 128×64×128 | 64×32×128 | General workloads |
+| `hybrid_small` | 64×64×128 | 32×32×128 | Small batch (better wave utilization) |
+| `hybrid_large` | 128×128×64 | 64×32×64 | Large batch (higher compute density) |
+
+### 4. bq512 Two-Accumulator
+
+- `block_size=512`: dequant every 4 K-tiles (K/512 times vs K/128)
+- Scale interface: `Q_k` (INT32 per quant block) × `F_g` (FP32 per super-group)
+- Lowest dequant frequency, minimal register pressure
 
 ## Requirements
 
 - Python 3.9+
 - PyTorch 2.0.0+
 - CUDA 11.8+
-- NVIDIA GPU with Compute Capability 70 or higher
-- Linux with x86_64 architecture (primary platform)
+- NVIDIA GPU with Compute Capability ≥ 70 (Volta and above)
+- Linux x86_64 (primary platform)
 
-## Installation
+## Quick Start
 
-### Option 1: From PyPI (Coming Soon)
-
-```bash
-pip install gemm-int8
-```
-
-### Option 2: From GitHub Release
-
-Download pre-built wheels directly from the GitHub releases page:
+### Build from Source
 
 ```bash
-pip install https://github.com/IST-DASLab/gemm-int8/releases/download/v$(VERSION)/gemm_int8-$(VERSION)-py3-none-$(PLATFORM_TAG).whl
-```
-
-Where:
-- `$(VERSION)` is the package version (e.g., "1.0.0")
-- `$(PLATFORM_TAG)` is your platform tag (e.g., "manylinux_2_24_x86_64")
-
-Or to install the latest build from the main branch:
-
-```bash
-pip install https://github.com/IST-DASLab/gemm-int8/releases/download/latest/gemm_int8-$(VERSION)-py3-none-$(PLATFORM_TAG).whl
-```
-
-### Option 3: Build From Source
-
-Building from source requires additional development tools:
-
-```bash
-# Clone the repository with submodules
 git clone --recursive https://github.com/IST-DASLab/gemm-int8.git
 cd gemm-int8
 
-# Make sure CUDA toolkit is properly installed and CUDA_HOME is set
-echo $CUDA_HOME  # Should point to your CUDA installation directory
-# If not set, you may need to run: export CUDA_HOME=/usr/local/cuda
+# Ensure CUDA_HOME is set
+echo $CUDA_HOME  # e.g., /usr/local/cuda
 
-# Also make sure you hace cmake and ninja installed in your environment.
 pip install cmake ninja
-
-# Build and install
 ./build.sh
-pip install .
-
-# Alternatively, for development installation
 pip install -e .
 ```
 
-
-### Integration with torch.compile
-
-The library is compatible with PyTorch's `torch.compile` i.e. if this code is used within a compiled scope:
+### Basic Usage — Hybrid Kernel (Recommended)
 
 ```python
 import torch
+import math
 import gemm_int8
 
-@torch.compile(dynamic=True)
-def compiled_matmul_routine(x, y, alpha):
-    # ... some pytorch operations
-    res = gemm_int8.matmul(x, y, alpha)
-    # ... some pytorch operations
-    return res
+# Problem size (typical LLM linear layer)
+M, K, N = 32768, 2560, 2048
+block_size = 256
+device = torch.device('cuda')
 
-# Use the compiled function
-result = compiled_matmul_routine(a, b, 1.0)
+# INT8 quantized inputs (A: activations, B: weights transposed)
+A_int8 = torch.randint(-128, 127, (M, K), dtype=torch.int8, device=device)
+B_int8_t = torch.randint(-128, 127, (N, K), dtype=torch.int8, device=device)
+
+# Block-wise scales
+K_blocks = math.ceil(K / block_size)
+M_blocks = math.ceil(M / 128)   # tile_M = 128
+N_blocks = math.ceil(N / 64)    # tile_N = 64
+
+scale_A = torch.rand(M_blocks, K_blocks, dtype=torch.float32, device=device) * 0.1
+scale_B = torch.rand(N_blocks, K_blocks, dtype=torch.float32, device=device) * 0.1
+
+# 2nd-level scale quantization for hybrid kernel
+Q_A, Q_B, F_A, F_B = gemm_int8.quantize_scales_for_hybrid(
+    scale_A, scale_B,
+    quant_block_size=block_size,
+    super_group_size=K_blocks,
+    Q_max=64
+)
+
+# Run fused kernel: quant(A) + INT8 GEMM + dequant in one shot
+out = gemm_int8.blockwise_fused_matmul_hybrid(
+    A_int8, B_int8_t, Q_A, Q_B, F_A, F_B,
+    quant_block_size=block_size,
+    super_group_size=K_blocks
+)
+# out: [M, N] bfloat16
 ```
 
-Note that compile won't optimize this kernel and it's only compatible in the sense that torch compile backend will recognize it as an operator and can be compiled along other operations in a routine.
+### Hybrid Kernel with Fused Bias
 
-## Benchmarks
+```python
+bias = torch.randn(N, dtype=torch.float32, device=device)
 
-You can run the benchmark script to compare performance:
+out = gemm_int8.blockwise_fused_matmul_hybrid_bias(
+    A_int8, B_int8_t, Q_A, Q_B, F_A, F_B, bias,
+    quant_block_size=block_size,
+    super_group_size=K_blocks
+)
+```
+
+### End-to-End: Online Quantization + GEMM
+
+A full pipeline including activation quantization (Triton kernel) and GEMM:
+
+```python
+import torch
+import torch.nn.functional as F
+import math
+import gemm_int8
+from int8_utils import blockwise_quant_int8
+
+M, N, K = 65536, 5120, 2048
+block_size = 256
+device = torch.device('cuda')
+
+# BF16 inputs
+A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+W_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+
+# --- Offline: pre-quantize weights ---
+K_blocks = math.ceil(K / block_size)
+
+def blockwise_quant_offline(x, block_m, block_k):
+    M_dim, K_dim = x.shape
+    m_blks = math.ceil(M_dim / block_m)
+    k_blks = math.ceil(K_dim / block_k)
+    x_q = torch.zeros(M_dim, k_blks * block_k, dtype=torch.int8, device=x.device)
+    x_s = torch.zeros(m_blks, k_blks, dtype=torch.float32, device=x.device)
+    for i in range(m_blks):
+        for j in range(k_blks):
+            r0, r1 = i * block_m, min((i + 1) * block_m, M_dim)
+            c0, c1 = j * block_k, min((j + 1) * block_k, K_dim)
+            blk = x[r0:r1, c0:c1].float()
+            absmax = blk.abs().max().clamp(min=1e-10)
+            scale = absmax / 127.0
+            x_s[i, j] = scale
+            x_q[r0:r1, c0:c1] = (blk / scale).round().clamp(-128, 127).to(torch.int8)
+    return x_q, x_s
+
+def quantize_scales_vectorized(scale, super_group_size, Q_max):
+    num_rows, K_blocks = scale.shape
+    G = math.ceil(K_blocks / super_group_size)
+    K_pad = G * super_group_size
+    if K_pad != K_blocks:
+        scale = F.pad(scale, (0, K_pad - K_blocks), value=0.0)
+    s = scale.view(num_rows, G, super_group_size)
+    F_g = s.abs().amax(dim=2, keepdim=True).clamp(min=1e-12) / Q_max
+    Q = torch.round(s / F_g).to(torch.int32).view(num_rows, K_pad)[:, :K_blocks].contiguous()
+    return Q, F_g.squeeze(2)
+
+# Weight quantization (offline, run once)
+W_q, W_s = blockwise_quant_offline(W_bf16, 128, block_size)
+Q_B, F_B = quantize_scales_vectorized(W_s, super_group_size=K_blocks, Q_max=64)
+
+# --- Online: quantize activations + GEMM ---
+def e2e_hybrid(A_bf16):
+    # Step 1: Triton blockwise quantization of activations
+    A_q, A_s = blockwise_quant_int8(A_bf16, 128, block_size)
+    # Step 2: 2nd-level scale quantization
+    Q_A, F_A = quantize_scales_vectorized(A_s, super_group_size=K_blocks, Q_max=64)
+    # Step 3: Fused INT8 GEMM
+    return gemm_int8.blockwise_fused_matmul_hybrid(
+        A_q, W_q, Q_A, Q_B, F_A, F_B,
+        quant_block_size=block_size,
+        super_group_size=K_blocks
+    )
+
+out = e2e_hybrid(A_bf16)  # [M, N] bfloat16
+```
+
+## Benchmarking
+
+### Kernel-Only Profiling (NCU)
+
+Profile a single kernel launch with NVIDIA Nsight Compute:
 
 ```bash
-python benchmark.py
+ncu --set full -o profile_hybrid python ncu_profile_hybrid.py
 ```
 
-This will generate a benchmark report and a visualization showing the speedup compared to BF16 matrix multiplication across different matrix sizes and token dimensions.
+See [`ncu_profile_hybrid.py`](ncu_profile_hybrid.py) for the profiling script.
 
-Typical speedups range from 2x to 4x depending on the matrix dimensions and hardware.
+### End-to-End Benchmark
 
-## Performance Tips
+Compare all kernel variants including online activation quantization:
 
-- For best performance, ensure your tensors are contiguous in memory
-- The library is optimized for large matrix sizes commonly found in transformer models
-- Performance benefits are most significant for matrix dimensions commonly used in LLM inference
+```bash
+python e2e_benchmark.py
+```
+
+This benchmarks **quant(A) + GEMM** end-to-end for all variants against a BF16 baseline (`F.linear`), reporting latency, TFLOPS, and speedup ratios. See [`e2e_benchmark.py`](e2e_benchmark.py) for the full benchmark script.
+
+## API Reference
+
+### Core Functions
+
+| Function | Tile | Block Size | Description |
+|----------|------|------------|-------------|
+| `blockwise_fused_matmul(x, y, x_s, y_s)` | 128×64 | 128 | Basic fused dequant |
+| `blockwise_fused_matmul_128x128(x, y, x_s, y_s)` | 128×128 | 128 | Larger tile for big M |
+| `blockwise_fused_matmul_kk256(x, y, x_s, y_s)` | 128×64 | 256 | bq256 fused dequant |
+| `blockwise_fused_matmul_fast_dequant(x, y, x_s, y_s)` | 128×64 | 256 | Bias-offset magic I2F |
+| `blockwise_fused_matmul_hybrid(x, y, Q_A, Q_B, F_A, F_B, ...)` | 128×64 | 256/512 | ⭐ Hybrid IMUL+magic |
+| `blockwise_fused_matmul_hybrid_bias(x, y, Q_A, Q_B, F_A, F_B, bias, ...)` | 128×64 | 256/512 | Hybrid + fused bias |
+| `blockwise_fused_matmul_hybrid_small(...)` | 64×64 | 256/512 | Small-batch hybrid |
+| `blockwise_fused_matmul_hybrid_small_bias(...)` | 64×64 | 256/512 | Small-batch + bias |
+| `blockwise_fused_matmul_hybrid_large(...)` | 128×128 | 256/512 | Large-batch hybrid |
+| `blockwise_fused_matmul_hybrid_large_bias(...)` | 128×128 | 256/512 | Large-batch + bias |
+| `blockwise_fused_matmul_bq512(...)` | 128×64 | 512 | bq512 two-accumulator |
+| `blockwise_fused_matmul_bq512_fast_dequant(...)` | 128×64 | 512 | bq512 + bias-offset |
+
+### Scale Quantization Helper
+
+```python
+Q_A, Q_B, F_A, F_B = gemm_int8.quantize_scales_for_hybrid(
+    input_scale,   # [M_blocks, K_blocks] FP32
+    weight_scale,  # [N_blocks, K_blocks] FP32
+    quant_block_size=256,
+    super_group_size=4,
+    Q_max=64       # integer quantization range
+)
+# Returns:
+#   Q_A: [M_blocks, K_blocks] INT32
+#   Q_B: [N_blocks, K_blocks] INT32
+#   F_A: [M_blocks, num_super_groups] FP32
+#   F_B: [N_blocks, num_super_groups] FP32
+```
+
+### `torch.compile` Compatibility
+
+All kernels are registered as custom ops and work within `torch.compile` scopes:
+
+```python
+@torch.compile(dynamic=True)
+def compiled_forward(x_q, w_q, Q_A, Q_B, F_A, F_B):
+    return gemm_int8.blockwise_fused_matmul_hybrid(
+        x_q, w_q, Q_A, Q_B, F_A, F_B,
+        quant_block_size=256, super_group_size=8)
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Citation
-
-If you use this library in your research, please cite:
 
 ```bibtex
 @software{gemm_int8,
   author = {Roberto L. Castro and Saleh Ashkboos and Soroush Tabesh},
-  title = {INT8 GEMM with PyTorch Interface},
+  title = {Fused Blockwise INT8 GEMM Kernels},
   url = {https://github.com/IST-DASLab/gemm-int8},
   year = {2024},
 }
@@ -175,4 +301,4 @@ If you use this library in your research, please cite:
 
 ## Acknowledgements
 
-This project uses [CUTLASS](https://github.com/NVIDIA/cutlass) for optimized CUDA kernels.
+This project uses [CUTLASS](https://github.com/NVIDIA/cutlass) for optimized CUDA Tensor Core primitives.
